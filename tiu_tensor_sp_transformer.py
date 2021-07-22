@@ -30,20 +30,6 @@ tiu_output = df[1].to_list()
 
 tiu_input[0:2]
 
-"""
-SentencepieceTokenizerを使う場合
-!pip install tensorflow_text
-from tensorflow_text import  SentencepieceTokenizer
-mod = tf.io.gfile.GFile("/content/drive/MyDrive/dataset/TIU/twitter/sentencepiece/sp_tiu1217.model", 'rb').read()
-tokenizer = SentencepieceTokenizer(
-    model=mod,
-    out_type=tf.string,
-    add_bos=True, 
-    add_eos=True
-)
-tokenizer.tokenize(["朝青龍になりたい"])
-"""
-
 !pip install sentencepiece > /dev/null
 import sentencepiece as spm
 
@@ -56,6 +42,7 @@ sp.id_to_piece([0,1,2,3,4,5])
 
 VOCAB_SIZE_INPUT=sp.get_piece_size()
 VOCAB_SIZE_OUTPUT=sp.get_piece_size()
+MAX_LENGTH = 20
 
 inputs = [[1] + sp.encode(sentence) + [2]
           for sentence in tiu_input]
@@ -64,7 +51,6 @@ outputs = [[1] + sp.encode(sentence) + [2]
 
 print(len(inputs), len(outputs))
 
-MAX_LENGTH = 20
 idx_to_remove = [count for count, sent in enumerate(inputs) if len(sent)>MAX_LENGTH]
 for idx in reversed(idx_to_remove):
   del inputs[idx]
@@ -88,6 +74,12 @@ outputs = tf.keras.preprocessing.sequence.pad_sequences(outputs,
                                                        padding='post',
                                                        maxlen=MAX_LENGTH)
 
+TEST_SIZE=1024
+inputs = inputs[:-1*TEST_SIZE]
+outputs = outputs[:-1*TEST_SIZE]
+inputs_test = inputs[-1*TEST_SIZE:]
+outputs_test = outputs[-1*TEST_SIZE:]
+
 BATCH_SIZE = 64
 BUFFER_SIZE = 20000
 
@@ -95,6 +87,18 @@ dataset = tf.data.Dataset.from_tensor_slices((inputs, outputs))
 dataset = dataset.cache()
 dataset = dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
 dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+
+dataset_test = tf.data.Dataset.from_tensor_slices((inputs_test, outputs_test))
+dataset_test = dataset_test.cache()
+dataset_test = dataset_test.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+dataset_test = dataset_test.prefetch(tf.data.experimental.AUTOTUNE)
+
+dataset_test = tf.data.Dataset.from_tensor_slices((inputs_test, outputs_test))
+dataset_test = dataset_test.cache()
+dataset_test = dataset_test.shuffle(2000).batch(BATCH_SIZE)
+dataset_test = dataset_test.prefetch(tf.data.experimental.AUTOTUNE)
+for (batch, (enc_inputs, targets)) in enumerate(dataset_test):
+  print(batch)
 
 class PositionalEncoding(layers.Layer):
   def __init__(self):
@@ -407,6 +411,7 @@ def loss_function(target, pred):
 
 train_loss = tf.keras.metrics.Mean(name="train_loss")
 train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name="train_accuracy")
+test_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name="test_accuracy")
 
 class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
 
@@ -438,6 +443,18 @@ if ckpt_manager.latest_checkpoint:
   ckpt.restore(ckpt_manager.latest_checkpoint)
   print("Latest checkpoint restored")
 
+def test_function():
+  s=0
+  for (batch, (enc_inputs, targets)) in enumerate(dataset_test):
+    dec_inputs = targets[:, :-1]
+    dec_outputs_real = targets[:, 1:]
+    predictions = transformer(enc_inputs, dec_inputs, True)
+    #loss = loss_function(dec_outputs_real, predictions)
+    
+    test_accuracy(dec_outputs_real, predictions)
+    s+=test_accuracy.result()
+  print("Test: Epoch {} Accuracy {:.4f}".format(epoch+1, s/(TEST_SIZE/BATCH_SIZE)))
+
 EPOCHS = 10
 for epoch in range(EPOCHS):
   print("Start number of epoch {}".format(epoch+1))
@@ -454,8 +471,8 @@ for epoch in range(EPOCHS):
       loss = loss_function(dec_outputs_real, predictions)
 
     gradients = tape.gradient(loss, transformer.trainable_variables)
-    #optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
     #WARNING回避で追加
+    #optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
     optimizer.apply_gradients((grad, var) for (grad, var) in zip(gradients, transformer.trainable_variables) if grad is not None)
 
     train_loss(loss)
@@ -466,8 +483,50 @@ for epoch in range(EPOCHS):
           epoch+1, batch, train_loss.result(), train_accuracy.result()
       ))
 
+  test_function()
   ckpt_save_path = ckpt_manager.save()
   print("Saving checkpoint for epoch {} at {}".format(epoch+1, ckpt_save_path))
 
   print("Time taken for 1 epoch: {} secs\n".format(time.time() - start))
+
+transformer.load_weights('/content/drive/MyDrive/model/TIU/tensor_sp_transformer/my_checkpoint')
+
+def evaluate(inp_sentence):
+  inp_sentence = [1] + sp.encode(inp_sentence) + [2]
+  enc_input = tf.expand_dims(inp_sentence, axis=0)
+
+  output = tf.expand_dims([1], axis=0)
+
+  for _ in range(MAX_LENGTH):
+    predictions = transformer(enc_input, output, False) # [1, seq_length, vocab_size_fr]
+    prediction = predictions[:, -1:, :]
+    predicted_id = tf.cast(tf.argmax(prediction, axis=-1), tf.int32)
+    if predicted_id == 2:
+      return tf.squeeze(output, axis=0)
+    output = tf.concat([output, predicted_id], axis=-1)
+
+  return (tf.squeeze(output, axis=0))
+
+def translate(sentence):
+  output = evaluate(sentence).numpy()
+  output =[i for i in output]
+  print(output)
+  predicted_sentence = sp.decode(output)
+  #predicted_sentence = sp.decode([i for i in output])
+  print("Input: {}".format(sentence))
+  print("predicted translation: {}".format(predicted_sentence))
+
+output = evaluate("朝に何した？").numpy()
+output = [int(i) for i in output]
+sp.decode(output)
+
+with open('/content/drive/MyDrive/dataset/newsample.txt') as f:
+  data = f.readlines()
+
+for d in data:
+  output = evaluate(d).numpy()
+  output = [int(i) for i in output]
+  print('細野：', d[:-1])
+  print('タウ：', sp.decode(output))
+  print('----------------------------------------------------------')
 
